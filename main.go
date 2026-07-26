@@ -2,13 +2,93 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/go-chi/chi/v5"
 )
+
+type TransactionLogger interface {
+	WriteDelete(key string)
+	WritePut(key, value string)
+}
+
+type FileTransactionLogger struct {
+	events       chan<- Event
+	errors       <-chan error
+	lastSequence uint64
+	file         *os.File
+}
+
+func (log *FileTransactionLogger) WritePut(key, value string) {
+	log.events <- Event{
+		EventType: EventPut,
+		key:       key,
+		value:     value,
+	}
+}
+
+func (log *FileTransactionLogger) WriteDelete(key string) {
+	log.events <- Event{
+		EventType: EventDelete,
+		key:       key,
+	}
+}
+
+func (log *FileTransactionLogger) err() <-chan error {
+	return log.errors
+}
+
+func (log *FileTransactionLogger) Run() {
+	events := make(chan Event, 20)
+	log.events = events
+
+	errs := make(chan error, 1)
+	log.errors = errs
+
+	go func() {
+		for event := range events {
+			log.lastSequence++
+			_, err := fmt.Fprintf(
+				log.file,
+				"%d\t%d\t%s\t%s\n",
+				log.lastSequence, event.EventType, event.key, event.value,
+			)
+			if err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+}
+
+func NewFileTransactionLogger(filename string) (TransactionLogger, error) {
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0755)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open transaction log file: %w", err)
+	}
+
+	return &FileTransactionLogger{file: file}, nil
+}
+
+type EventType int
+
+const (
+	_ EventType = iota
+	EventPut
+	EventDelete
+)
+
+type Event struct {
+	Sequence uint64
+	EventType
+	key   string
+	value string
+}
 
 type LockMap struct {
 	sync.RWMutex
@@ -91,6 +171,7 @@ func main() {
 	r := chi.NewRouter()
 	r.Put("/v1/key/{key}", putHandler)
 	r.Get("/v1/key/{key}", getHandler)
+	r.Delete("v1/key/{key}", deleteHandler)
 
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
